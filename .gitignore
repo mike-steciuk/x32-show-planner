@@ -1,0 +1,19 @@
+node_modules/
+dist/
+
+# Local app data and generated runtime files
+data/
+store.json
+*.log
+
+# Tool/editor/cache files
+.codex-remote-attachments/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+
+# Vite / package-manager cache artifacts
+.vite/
+.vite-temp/
+.pnpm-store/
