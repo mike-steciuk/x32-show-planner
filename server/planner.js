@@ -4,8 +4,8 @@ const COLORS = {
 }
 
 const PRIORITY = {
-  vocal: 10, drums: 20, bass: 30, guitar: 40, keys: 50,
-  brass: 60, strings: 65, playback: 70, other: 80
+  vocal: 10, guitar: 20, bass: 30, keys: 40,
+  brass: 50, strings: 55, playback: 60, other: 70, drums: 90
 }
 
 const ICONS = {

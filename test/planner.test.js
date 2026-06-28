@@ -7,6 +7,7 @@ test('expands the default band and puts vocals first', () => {
   assert.equal(inputs.length, 12)
   assert.equal(inputs[0].kind, 'vocal')
   assert.equal(inputs[1].kind, 'vocal')
+  assert.deepEqual(inputs.map(item => item.kind), ['vocal', 'vocal', 'guitar', 'bass', 'keys', 'keys', 'drums', 'drums', 'drums', 'drums', 'drums', 'drums'])
   assert.equal(inputs.find(item => item.kind === 'guitar').color, 'CY')
   assert.equal(inputs.find(item => item.kind === 'bass').color, 'WH')
   assert.deepEqual(inputs.filter(item => item.kind === 'drums').map(item => item.label), ['Kick', 'Snare', 'Rack Tom', 'Floor Tom', 'OH Left', 'OH Right'])
