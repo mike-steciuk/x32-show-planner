@@ -50,6 +50,7 @@ const bandMode = ref('existing')
 const bandId = ref('')
 const bandName = ref('')
 const syncing = ref(false)
+const syncStage = ref('')
 const mixerHost = ref('192.168.1.255')
 const selectedEq = ref([1, 2, 3, 4])
 const draggedInputId = ref('')
@@ -60,7 +61,7 @@ const upcoming = computed(() => events.value.filter(event => event.date >= today
 const past = computed(() => events.value.filter(event => event.date < today))
 const selectedChannels = computed(() => selectedEq.value.map(number => mixer.value.channels?.[number - 1]).filter(Boolean))
 const pageTitle = computed(() => tab.value === 'workspace' && currentEvent.value ? currentEvent.value.name : tab.value)
-const syncLabel = computed(() => syncing.value ? 'Syncing...' : 'Sync ' + (currentEvent.value?.bands.length || 0) + ' scenes to X32')
+const syncLabel = computed(() => syncing.value ? (syncStage.value || 'Syncing...') : 'Sync ' + (currentEvent.value?.bands.length || 0) + ' scenes to X32')
 const fallbackOutputSockets = Array.from({ length: 16 }, (_, index) => ({ id: 'A' + (index + 1), label: `SD8-${index < 8 ? 1 : 2} \u00b7 OUT ${index % 8 + 1}`, group: 'AES50-A / SD8' }))
 const socketGroups = computed(() => Object.entries((compiled.value.sockets ?? []).reduce((groups, socket) => {
   const group = socket.group || 'Inputs'
@@ -151,17 +152,19 @@ const autoPatch = async () => { const patches={}; compiled.value.inputs.slice(0,
 const copyInvite = async slot => { await navigator.clipboard.writeText(inviteUrl(slot)); notify('Invite link copied') }
 const pollSyncJob = async job => {
   let current = job
+  syncStage.value = current.stage || 'Queued'
   while (current.status === 'queued' || current.status === 'running') {
     await new Promise(resolve => setTimeout(resolve, 1500))
     current = await request('/api/sync-jobs/' + current.id)
+    syncStage.value = current.stage || current.status
   }
   if (current.status === 'failed') throw new Error(current.error || 'Sync failed')
   return current.result
 }
-const syncEvent = async () => { syncing.value=true; try { const started=await request('/api/events/'+currentEvent.value.id+'/sync',{method:'POST'}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); await reload(); currentEvent.value=await request('/api/events/'+currentEvent.value.id); notify(result.scenes.length+' X32 scenes created') } catch(error){ notify(error.message) } finally{ syncing.value=false } }
-const syncArtistScene = async () => { if(!currentSlot.value)return; syncing.value=true; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/sync',{method:'POST',body:JSON.stringify({mode:'scene'})}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); await reload(); currentEvent.value=await request('/api/events/'+currentEvent.value.id); notify('Scene '+result.result.sceneSlot+' synced for '+result.result.bandName) } catch(error){ notify(error.message) } finally{ syncing.value=false } }
-const syncArtistChannels = async () => { if(!currentSlot.value)return; syncing.value=true; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/sync',{method:'POST',body:JSON.stringify({mode:'channels'})}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); notify(result.result.commandCount+' channel commands applied for '+result.result.bandName) } catch(error){ notify(error.message) } finally{ syncing.value=false } }
-const syncInputChannel = async input => { if(!currentSlot.value)return; syncing.value=true; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/inputs/'+input.id+'/sync',{method:'POST'}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); notify('CH '+String(input.channel).padStart(2,'0')+' applied ('+result.result.commandCount+' commands)') } catch(error){ notify(error.message) } finally{ syncing.value=false } }
+const syncEvent = async () => { syncing.value=true; syncStage.value='Starting'; try { const started=await request('/api/events/'+currentEvent.value.id+'/sync',{method:'POST'}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); await reload(); currentEvent.value=await request('/api/events/'+currentEvent.value.id); notify(result.scenes.length+' X32 scenes created') } catch(error){ notify(error.message) } finally{ syncing.value=false; syncStage.value='' } }
+const syncArtistScene = async () => { if(!currentSlot.value)return; syncing.value=true; syncStage.value='Starting'; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/sync',{method:'POST',body:JSON.stringify({mode:'scene'})}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); await reload(); currentEvent.value=await request('/api/events/'+currentEvent.value.id); notify('Scene '+result.result.sceneSlot+' synced for '+result.result.bandName) } catch(error){ notify(error.message) } finally{ syncing.value=false; syncStage.value='' } }
+const syncArtistChannels = async () => { if(!currentSlot.value)return; syncing.value=true; syncStage.value='Starting'; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/sync',{method:'POST',body:JSON.stringify({mode:'channels'})}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); notify(result.result.commandCount+' channel commands applied for '+result.result.bandName) } catch(error){ notify(error.message) } finally{ syncing.value=false; syncStage.value='' } }
+const syncInputChannel = async input => { if(!currentSlot.value)return; syncing.value=true; syncStage.value='Starting'; try { const started=await request('/api/events/'+currentEvent.value.id+'/bands/'+currentSlot.value.id+'/inputs/'+input.id+'/sync',{method:'POST'}); notify('Sync started: '+started.job.label); const result=await pollSyncJob(started.job); notify('CH '+String(input.channel).padStart(2,'0')+' applied ('+result.result.commandCount+' commands)') } catch(error){ notify(error.message) } finally{ syncing.value=false; syncStage.value='' } }
 const useSimulator = async () => { mixer.value=await request('/api/console/mode',{method:'POST',body:JSON.stringify({mode:'simulator'})}); notify('Simulator connected') }
 const connect = async () => { try { mixer.value=await request('/api/console/connect',{method:'POST',body:JSON.stringify({host:mixerHost.value})}); notify('X32 connected') } catch(error){ notify(error.message) } }
 const addInventory = async () => { if(!newGear.name.trim())return notify('Name the inventory item'); await request('/api/inventory',{method:'POST',body:JSON.stringify(newGear)}); Object.assign(newGear,{name:'',type:'xlr',quantity:1,length:'',notes:''}); await reload(); notify('Inventory item added') }

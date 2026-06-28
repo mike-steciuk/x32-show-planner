@@ -1,18 +1,18 @@
 # The Ferndale Set Production Desk
 
+![The Ferndale Set Production Desk](public/production-desk-banner.png)
+
 Turn band advances into Behringer X32-ready show files.
 
 The Ferndale Set Production Desk is a local-first production planning app for small venues, backyard concerts, house shows, and DIY audio teams that want the polish of a real advance workflow without dragging a spreadsheet, text thread, and mixer console into a three-way knife fight.
 
 It collects artist input needs, builds a fader plan, maps SD8/X32 routing, tracks gear, prepares monitor and PA outputs, generates run-of-show tasks, and syncs verified scenes to a Behringer X32 over OSC.
 
-![The Ferndale Set Production Desk](public/ferndale-set-logo.jpg)
-
 ![10-second Production Desk promo](public/ferndale-set-commercial.gif)
 
 ## The pitch
 
-Most show prep starts with “just send me what you need” and ends with a messy note, a half-remembered stage plot, and somebody asking for more vocal in a monitor that was never labeled.
+Most show prep starts with "just send me what you need" and ends with a messy note, a half-remembered stage plot, and somebody asking for more vocal in a monitor that was never labeled.
 
 This app gives the whole process a home:
 

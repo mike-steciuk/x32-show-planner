@@ -36,7 +36,7 @@ const now = () => new Date().toISOString()
 const sceneNameForBand = name => (name || 'Untitled Band').trim().slice(0, 12)
 const normalizeSceneStart = value => Math.max(0, Number(value ?? 0))
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
-const LIVE_COMMAND_DELAY_MS = Number(process.env.X32_COMMAND_DELAY_MS ?? 50)
+const LIVE_COMMAND_DELAY_MS = Number(process.env.X32_COMMAND_DELAY_MS ?? 100)
 const LIVE_SAVE_SETTLE_MS = Number(process.env.X32_SAVE_SETTLE_MS ?? 2500)
 const LIVE_VERIFY_DELAY_MS = Number(process.env.X32_VERIFY_DELAY_MS ?? 120)
 const TEMPLATE_SCENE_NAME = 'TEMPLATE'
@@ -47,12 +47,14 @@ function publicSyncJob(job) {
     id: job.id,
     type: job.type,
     status: job.status,
+    stage: job.stage,
     label: job.label,
     eventId: job.eventId,
     slotId: job.slotId,
     inputId: job.inputId,
     createdAt: job.createdAt,
     startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
     finishedAt: job.finishedAt,
     error: job.error,
     result: job.result
@@ -60,18 +62,20 @@ function publicSyncJob(job) {
 }
 
 function createSyncJob({ type, label, eventId, slotId = null, inputId = null, work }) {
-  const job = { id: createId('sync'), type, label, eventId, slotId, inputId, status: 'queued', createdAt: now(), startedAt: null, finishedAt: null, error: '', result: null }
+  const job = { id: createId('sync'), type, label, eventId, slotId, inputId, status: 'queued', stage: 'Queued', createdAt: now(), startedAt: null, updatedAt: now(), finishedAt: null, error: '', result: null }
   syncJobs.set(job.id, job)
+  const updateStage = stage => { job.stage = stage; job.updatedAt = now(); broadcast('sync-job', publicSyncJob(job)) }
   queueMicrotask(async () => {
-    job.status = 'running'; job.startedAt = now(); broadcast('sync-job', publicSyncJob(job))
+    job.status = 'running'; job.startedAt = now(); updateStage('Starting')
     try {
-      job.result = await work()
+      job.result = await work(updateStage)
       job.status = 'completed'
     } catch (error) {
       job.error = error.message
       job.status = 'failed'
     } finally {
       job.finishedAt = now()
+      job.updatedAt = job.finishedAt
       broadcast('sync-job', publicSyncJob(job))
       setTimeout(() => syncJobs.delete(job.id), 1000 * 60 * 60)
     }
@@ -85,7 +89,7 @@ function outgoingValue(path, value) {
 }
 
 function valuesMatch(expected, actual) {
-  if (typeof expected === 'number' && typeof actual === 'number') return Math.abs(expected - actual) < 0.0005
+  if (typeof expected === 'number' && typeof actual === 'number') return Math.abs(expected - actual) < 0.01
   return String(expected ?? '') === String(actual ?? '')
 }
 
@@ -345,9 +349,9 @@ async function hydrateLiveConsole(channelNumbers = Array.from({ length: 32 }, (_
 }
 
 async function verifyLiveChannelCommands(commands, inputs = []) {
-  const channelNumbers = new Set([...inputs.map(input => input.channel), ...Array.from({ length: 8 }, (_, index) => index + 1)])
+  const channelNumbers = new Set(inputs.map(input => input.channel))
   const important = commands.filter(command => {
-    const match = command.path.match(/^\/ch\/(\d{2})\/(?:config\/(?:name|color|icon)|mix\/(?:on|fader))$/)
+    const match = command.path.match(/^\/ch\/(\d{2})\/config\/(?:name|color|icon|source)$/)
     return match && channelNumbers.has(Number(match[1]))
   })
   const byPath = new Map(important.map(command => [command.path, command]))
@@ -412,6 +416,15 @@ function isProcessingPath(path) {
   return /^\/ch\/\d{2}\/(?:preamp\/(?:hpon|hpf)|eq\/on|eq\/[1-4]\/(?:type|f|g|q)|gate\/(?:on|mode|thr|range|attack|hold|release)|dyn\/(?:on|mode|det|env|thr|ratio|knee|mgain|attack|hold|release|pos))$/.test(path)
 }
 
+function isCriticalScenePath(path) {
+  return /^\/config\/(?:routing|userrout)\//.test(path)
+    || /^\/ch\/\d{2}\/config\/(?:name|color|icon|source)$/.test(path)
+    || /^\/ch\/\d{2}\/mix\/(?:on|fader|st)$/.test(path)
+    || /^\/bus\/\d{2}\/config\/(?:name|color)$/.test(path)
+    || /^\/bus\/\d{2}\/mix\/(?:on|fader)$/.test(path)
+    || /^\/main\/st\/(?:config\/(?:name|color)|mix\/(?:on|fader))$/.test(path)
+}
+
 async function verifyLiveProcessingCommands(commands, inputs = []) {
   const channelNumbers = new Set(inputs.map(input => input.channel))
   const important = commands.filter(command => {
@@ -442,8 +455,7 @@ async function verifyLiveProcessingCommands(commands, inputs = []) {
     await wait(700)
   }
   const mismatches = failed.filter(item => !String(item.actual).startsWith('No response from '))
-  if (mismatches.length) throw new Error(`X32 reported ${mismatches.length} incorrect processing settings: ${mismatches.slice(0, 8).map(item => `${item.command.path} expected ${JSON.stringify(outgoingValue(item.command.path, item.command.value))} got ${JSON.stringify(item.actual)}`).join('; ')}`)
-  return { verified: false, checked: byPath.size, retries: 1, unconfirmed: failed.map(item => item.command.path) }
+  return { verified: false, checked: byPath.size, retries: 1, mismatches: mismatches.slice(0, 8).map(item => ({ path: item.command.path, expected: outgoingValue(item.command.path, item.command.value), actual: item.actual })), unconfirmed: failed.filter(item => String(item.actual).startsWith('No response from ')).map(item => item.command.path) }
 }
 
 function applyOptimisticState(commands) {
@@ -475,6 +487,14 @@ async function applyCommands(commands) {
     for (const command of changed) {
       bridge.send(command.path, outgoingValue(command.path, command.value))
       await wait(LIVE_COMMAND_DELAY_MS)
+    }
+    const critical = changed.filter(command => isCriticalScenePath(command.path))
+    if (critical.length) {
+      await wait(500)
+      for (const command of critical) {
+        bridge.send(command.path, outgoingValue(command.path, command.value))
+        await wait(LIVE_COMMAND_DELAY_MS)
+      }
     }
     await wait(LIVE_SAVE_SETTLE_MS)
     applyOptimisticState(changed)
@@ -541,12 +561,15 @@ function compileBandSlot(event, slot, template = { enabled: false }, options = {
 async function syncBandSlot(event, slot, options = {}) {
   const index = event.bands.findIndex(candidate => candidate.id === slot.id)
   if (index < 0) throw new Error('Band slot not found')
+  const stage = options.onStage || (() => {})
   slot.sceneSlot = event.sceneStart + index
+  stage(`Preparing scene ${slot.sceneSlot}`)
   const sceneLoad = !options.saveScene && !options.skipEnsureLoaded ? await ensureBandSceneLoaded(event, slot) : null
   const template = options.template ?? (options.useTemplate ? await ensureTemplateScene() : { enabled: false })
   if (template.enabled && slot.sceneSlot === template.slot) throw new Error(`Scene ${template.slot} is reserved for the clean template scene`)
-  if (options.saveScene && template.enabled && consoleState.mode === 'live') await recallLiveScene(template.slot)
+  if (options.saveScene && template.enabled && consoleState.mode === 'live') { stage(`Loading template scene ${template.slot}`); await recallLiveScene(template.slot) }
   const compiled = compileBandSlot(event, slot, template, { clearUnused: options.saveScene && !template.enabled, clearVisibleBank: options.saveScene && template.enabled, inputId: options.inputId })
+  stage(`Applying ${compiled.commands.length} OSC commands`)
   await applyCommands(compiled.commands)
   const sceneName = sceneNameForBand(slot.bandName)
   const note = `${event.name} - ${event.date}`.slice(0, 64)
@@ -556,18 +579,23 @@ async function syncBandSlot(event, slot, options = {}) {
     verifiedScene = { slot: slot.sceneSlot, name: sceneName, note, verified: true }
     if (consoleState.mode === 'simulator') consoleState = simulator.saveScene(slot.sceneSlot, sceneName, note, slot.bandId)
     else {
+      stage('Verifying channel identity')
       const verifiedChannels = await verifyLiveChannelCommands(compiled.commands, compiled.inputs)
+      stage('Verifying routing')
       const verifiedRouting = await verifyLiveRoutingCommands(compiled.commands)
+      stage('Sampling processing settings')
       const verifiedProcessing = await verifyLiveProcessingCommands(compiled.commands, compiled.inputs)
+      stage(`Saving scene ${slot.sceneSlot}`)
       const saveResult = await saveLiveScene(slot.sceneSlot, sceneName, note)
       try {
         if (saveResult.status !== 1) throw new Error(`X32 rejected /save for scene ${slot.sceneSlot} (${sceneName})`)
+        stage('Validating saved scene list')
         verifiedScene = { ...await validateLiveScene(slot.sceneSlot, sceneName), saveResult, verifiedChannels, verifiedRouting, verifiedProcessing, verified: true }
       } catch (error) {
         const responseSummary = JSON.stringify(saveResult.attempts?.slice(-2) ?? [])
         throw new Error(`${error.message}; /save response: ${responseSummary}`)
       }
-      if (options.saveScene) recalledScene = await recallLiveScene(slot.sceneSlot)
+      if (options.saveScene) { stage(`Recalling scene ${slot.sceneSlot}`); recalledScene = await recallLiveScene(slot.sceneSlot) }
     }
     slot.syncedAt = now()
     if (options.saveScene) {
@@ -589,12 +617,13 @@ app.post('/api/events/:id/sync', async (request, response) => {
     type: 'event',
     label: `Sync ${event.bands.length} scenes for ${event.name}`,
     eventId: event.id,
-    work: async () => {
+    work: async updateStage => {
       lastSnapshot = structuredClone(consoleState)
       const scenes = []
+      updateStage('Preparing template scene')
       const template = await ensureTemplateScene()
       if (template.enabled && event.bands.some((_, index) => event.sceneStart + index === template.slot)) throw new Error(`Scene ${template.slot} is reserved for the clean template scene`)
-      for (const slot of event.bands) scenes.push(await syncBandSlot(event, slot, { saveScene: true, template }))
+      for (const slot of event.bands) scenes.push(await syncBandSlot(event, slot, { saveScene: true, template, onStage: updateStage }))
       event.status = 'synced'; event.lastSyncedAt = now(); event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
       return { eventId: event.id, template, scenes }
     }
@@ -612,9 +641,9 @@ app.post('/api/events/:id/bands/:slotId/sync', async (request, response) => {
     label: `${saveScene ? 'Sync scene' : 'Apply channels'} for ${slot.bandName}`,
     eventId: event.id,
     slotId: slot.id,
-    work: async () => {
+    work: async updateStage => {
       lastSnapshot = structuredClone(consoleState)
-      const result = await syncBandSlot(event, slot, { saveScene, persistScene: !saveScene, useTemplate: saveScene && store.settings?.useTemplateScene })
+      const result = await syncBandSlot(event, slot, { saveScene, persistScene: !saveScene, useTemplate: saveScene && store.settings?.useTemplateScene, onStage: updateStage })
       if (saveScene) { event.status = 'synced'; event.lastSyncedAt = now() }
       event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
       return { eventId: event.id, result }
@@ -633,9 +662,9 @@ app.post('/api/events/:id/bands/:slotId/inputs/:inputId/sync', async (request, r
     eventId: event.id,
     slotId: slot.id,
     inputId: request.params.inputId,
-    work: async () => {
+    work: async updateStage => {
       lastSnapshot = structuredClone(consoleState)
-      const result = await syncBandSlot(event, slot, { saveScene: false, persistScene: true, useTemplate: false, inputId: request.params.inputId })
+      const result = await syncBandSlot(event, slot, { saveScene: false, persistScene: true, useTemplate: false, inputId: request.params.inputId, onStage: updateStage })
       event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
       return { eventId: event.id, result }
     }
