@@ -6,7 +6,7 @@ The Ferndale Set Production Desk is a local-first production planning app for sm
 
 It collects artist input needs, builds a fader plan, maps SD8/X32 routing, tracks gear, prepares monitor and PA outputs, generates run-of-show tasks, and syncs verified scenes to a Behringer X32 over OSC.
 
-![The Ferndale Set Production Desk](public/logo.svg)
+![The Ferndale Set Production Desk](public/ferndale-set-logo.jpg)
 
 ![10-second Production Desk promo](public/ferndale-set-commercial.gif)
 
