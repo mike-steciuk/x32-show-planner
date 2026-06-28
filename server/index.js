@@ -18,6 +18,7 @@ let store = await loadStore()
 let plan = structuredClone(defaultPlan)
 let consoleState = simulator.state()
 let lastSnapshot = null
+const syncJobs = new Map()
 
 const COLOR_NAMES = ['OFF', 'RD', 'GN', 'YE', 'BL', 'MG', 'CY', 'WH', 'OFF', 'RD', 'GN', 'YE', 'BL', 'MG', 'CY', 'WH']
 const BASE_COLOR_VALUES = Object.fromEntries(COLOR_NAMES.slice(0, 8).map((name, index) => [name, index]))
@@ -30,7 +31,7 @@ const normalizedFrequency = value => 20 * Math.pow(1000, value)
 const normalizedGain = value => -15 + 30 * value
 const normalizedQ = value => 10 * Math.pow(.03, value)
 const mixerValue = async path => (await bridge.request(path, 1000)).args[0]
-const verifiedMixerValue = async path => (await bridge.request(path, 2500)).args[0]
+const verifiedMixerValue = async path => (await bridge.request(path, 900)).args[0]
 const now = () => new Date().toISOString()
 const sceneNameForBand = name => (name || 'Untitled Band').trim().slice(0, 12)
 const normalizeSceneStart = value => Math.max(0, Number(value ?? 0))
@@ -40,6 +41,43 @@ const LIVE_SAVE_SETTLE_MS = Number(process.env.X32_SAVE_SETTLE_MS ?? 2500)
 const LIVE_VERIFY_DELAY_MS = Number(process.env.X32_VERIFY_DELAY_MS ?? 120)
 const TEMPLATE_SCENE_NAME = 'TEMPLATE'
 const templateName = () => String(store.settings?.templateSceneName || TEMPLATE_SCENE_NAME).slice(0, 12)
+
+function publicSyncJob(job) {
+  return {
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    label: job.label,
+    eventId: job.eventId,
+    slotId: job.slotId,
+    inputId: job.inputId,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    error: job.error,
+    result: job.result
+  }
+}
+
+function createSyncJob({ type, label, eventId, slotId = null, inputId = null, work }) {
+  const job = { id: createId('sync'), type, label, eventId, slotId, inputId, status: 'queued', createdAt: now(), startedAt: null, finishedAt: null, error: '', result: null }
+  syncJobs.set(job.id, job)
+  queueMicrotask(async () => {
+    job.status = 'running'; job.startedAt = now(); broadcast('sync-job', publicSyncJob(job))
+    try {
+      job.result = await work()
+      job.status = 'completed'
+    } catch (error) {
+      job.error = error.message
+      job.status = 'failed'
+    } finally {
+      job.finishedAt = now()
+      broadcast('sync-job', publicSyncJob(job))
+      setTimeout(() => syncJobs.delete(job.id), 1000 * 60 * 60)
+    }
+  })
+  return publicSyncJob(job)
+}
 
 function outgoingValue(path, value) {
   if (/\/config\/color$/.test(path) && typeof value === 'string') return COLOR_VALUES[value] ?? 0
@@ -314,7 +352,7 @@ async function verifyLiveChannelCommands(commands, inputs = []) {
   })
   const byPath = new Map(important.map(command => [command.path, command]))
   let failed = []
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     failed = []
     for (const command of byPath.values()) {
       const expected = outgoingValue(command.path, command.value)
@@ -337,7 +375,37 @@ async function verifyLiveChannelCommands(commands, inputs = []) {
   }
   const mismatches = failed.filter(item => !String(item.actual).startsWith('No response from '))
   if (mismatches.length) throw new Error(`X32 reported ${mismatches.length} incorrect visible-bank channel settings: ${mismatches.slice(0, 8).map(item => `${item.command.path} expected ${JSON.stringify(outgoingValue(item.command.path, item.command.value))} got ${JSON.stringify(item.actual)}`).join('; ')}`)
-  return { verified: false, checked: byPath.size, retries: 3, unconfirmed: failed.map(item => item.command.path) }
+  return { verified: false, checked: byPath.size, retries: 2, unconfirmed: failed.map(item => item.command.path) }
+}
+
+async function verifyLiveRoutingCommands(commands) {
+  const important = commands.filter(command => /^\/config\/(?:routing|userrout)\//.test(command.path) || /^\/ch\/\d{2}\/config\/source$/.test(command.path))
+  const byPath = new Map(important.map(command => [command.path, command]))
+  let failed = []
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    failed = []
+    for (const command of byPath.values()) {
+      const expected = outgoingValue(command.path, command.value)
+      let actual
+      try {
+        actual = await verifiedMixerValue(command.path)
+      } catch (error) {
+        failed.push({ command, actual: error.message })
+        continue
+      }
+      if (!valuesMatch(expected, actual)) failed.push({ command, actual })
+      await wait(LIVE_VERIFY_DELAY_MS)
+    }
+    if (!failed.length) return { verified: true, checked: byPath.size, retries: attempt - 1 }
+    for (const { command } of failed) {
+      bridge.send(command.path, outgoingValue(command.path, command.value))
+      await wait(LIVE_COMMAND_DELAY_MS)
+    }
+    await wait(700)
+  }
+  const mismatches = failed.filter(item => !String(item.actual).startsWith('No response from '))
+  if (mismatches.length) throw new Error(`X32 reported ${mismatches.length} incorrect routing settings: ${mismatches.slice(0, 8).map(item => `${item.command.path} expected ${JSON.stringify(outgoingValue(item.command.path, item.command.value))} got ${JSON.stringify(item.actual)}`).join('; ')}`)
+  return { verified: false, checked: byPath.size, retries: 2, unconfirmed: failed.map(item => item.command.path) }
 }
 
 function isProcessingPath(path) {
@@ -349,10 +417,10 @@ async function verifyLiveProcessingCommands(commands, inputs = []) {
   const important = commands.filter(command => {
     const match = command.path.match(/^\/ch\/(\d{2})\//)
     return match && channelNumbers.has(Number(match[1])) && isProcessingPath(command.path)
-  })
+  }).slice(0, 8)
   const byPath = new Map(important.map(command => [command.path, command]))
   let failed = []
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 1; attempt++) {
     failed = []
     for (const command of byPath.values()) {
       const expected = outgoingValue(command.path, command.value)
@@ -375,7 +443,7 @@ async function verifyLiveProcessingCommands(commands, inputs = []) {
   }
   const mismatches = failed.filter(item => !String(item.actual).startsWith('No response from '))
   if (mismatches.length) throw new Error(`X32 reported ${mismatches.length} incorrect processing settings: ${mismatches.slice(0, 8).map(item => `${item.command.path} expected ${JSON.stringify(outgoingValue(item.command.path, item.command.value))} got ${JSON.stringify(item.actual)}`).join('; ')}`)
-  return { verified: false, checked: byPath.size, retries: 3, unconfirmed: failed.map(item => item.command.path) }
+  return { verified: false, checked: byPath.size, retries: 1, unconfirmed: failed.map(item => item.command.path) }
 }
 
 function applyOptimisticState(commands) {
@@ -422,7 +490,7 @@ app.get('/api/status', (_request, response) => response.json({ ok: true, console
 
 app.get('/api/events', (_request, response) => response.json(store.events.slice().sort((a, b) => b.date.localeCompare(a.date))))
 app.post('/api/events', async (request, response) => {
-  const event = { id: createId('event'), slug: slugify(request.body.name), name: request.body.name || 'Untitled event', date: request.body.date || new Date().toISOString().slice(0, 10), venue: request.body.venue || '', loadIn: request.body.loadIn || '', notes: request.body.notes || '', status: 'planning', sceneStart: normalizeSceneStart(request.body.sceneStart), bands: [], house: { requirements: [] }, gear: { items: [] }, runOfShow: [], createdAt: now(), updatedAt: now() }
+  const event = { id: createId('event'), slug: slugify(request.body.name), name: request.body.name || 'Untitled event', date: request.body.date || new Date().toISOString().slice(0, 10), venue: request.body.venue || '', loadIn: request.body.loadIn || '', notes: request.body.notes || '', status: 'planning', sceneStart: normalizeSceneStart(request.body.sceneStart), outputPatches: { mainL: 'A1', mainR: 'A2' }, bands: [], house: { requirements: [] }, gear: { items: [] }, runOfShow: [], createdAt: now(), updatedAt: now() }
   store.events.push(event); await persist(); response.status(201).json(event)
 })
 app.get('/api/events/:id', (request, response) => { const event = findEvent(request.params.id); event ? response.json(event) : response.status(404).json({ error: 'Event not found' }) })
@@ -454,7 +522,7 @@ app.delete('/api/events/:id/bands/:slotId', async (request, response) => {
 })
 
 function compileBandSlot(event, slot, template = { enabled: false }, options = {}) {
-  const compiled = compilePlan({ members: slot.members, patches: slot.patches, channelOverrides: slot.channelOverrides, clearUnused: Boolean(options.clearUnused) }, consoleState)
+  const compiled = compilePlan({ members: slot.members, monitors: slot.monitors, patches: slot.patches, channelOverrides: slot.channelOverrides, monitorPatches: slot.monitorPatches, outputPatches: event.outputPatches, clearUnused: Boolean(options.clearUnused) }, consoleState)
   if (!compiled.inputs.length) throw new Error(`${slot.bandName} has not submitted an input list`)
   if (compiled.warnings.length) throw new Error(`${slot.bandName} has incomplete input routing: ${compiled.warnings.join('; ')}`)
   if (template.enabled && options.clearVisibleBank) compiled.commands.push(...clearUnusedVisibleBankCommands(compiled.inputs.length))
@@ -462,7 +530,8 @@ function compileBandSlot(event, slot, template = { enabled: false }, options = {
     const input = compiled.inputs.find(candidate => candidate.id === options.inputId)
     if (!input) throw new Error('Input channel not found in this artist setup')
     const ch = String(input.channel).padStart(2, '0')
-    compiled.commands = compiled.commands.filter(command => command.path.startsWith(`/ch/${ch}/`) || command.path === `/config/userrout/in/${ch}`)
+    const routingBlock = input.channel <= 8 ? '/config/routing/IN/1-8' : input.channel <= 16 ? '/config/routing/IN/9-16' : input.channel <= 24 ? '/config/routing/IN/17-24' : '/config/routing/IN/25-32'
+    compiled.commands = compiled.commands.filter(command => command.path.startsWith(`/ch/${ch}/`) || command.path === `/config/userrout/in/${ch}` || command.path === routingBlock)
     compiled.inputs = [input]
   }
   if (consoleState.mode === 'live') compiled.commands = compiled.commands.map(command => ({ ...command, changed: true }))
@@ -482,20 +551,23 @@ async function syncBandSlot(event, slot, options = {}) {
   const sceneName = sceneNameForBand(slot.bandName)
   const note = `${event.name} - ${event.date}`.slice(0, 64)
   let verifiedScene = null
+  let recalledScene = null
   if (options.saveScene || options.persistScene) {
     verifiedScene = { slot: slot.sceneSlot, name: sceneName, note, verified: true }
     if (consoleState.mode === 'simulator') consoleState = simulator.saveScene(slot.sceneSlot, sceneName, note, slot.bandId)
     else {
       const verifiedChannels = await verifyLiveChannelCommands(compiled.commands, compiled.inputs)
+      const verifiedRouting = await verifyLiveRoutingCommands(compiled.commands)
       const verifiedProcessing = await verifyLiveProcessingCommands(compiled.commands, compiled.inputs)
       const saveResult = await saveLiveScene(slot.sceneSlot, sceneName, note)
       try {
         if (saveResult.status !== 1) throw new Error(`X32 rejected /save for scene ${slot.sceneSlot} (${sceneName})`)
-        verifiedScene = { ...await validateLiveScene(slot.sceneSlot, sceneName), saveResult, verifiedChannels, verifiedProcessing, verified: true }
+        verifiedScene = { ...await validateLiveScene(slot.sceneSlot, sceneName), saveResult, verifiedChannels, verifiedRouting, verifiedProcessing, verified: true }
       } catch (error) {
         const responseSummary = JSON.stringify(saveResult.attempts?.slice(-2) ?? [])
         throw new Error(`${error.message}; /save response: ${responseSummary}`)
       }
+      if (options.saveScene) recalledScene = await recallLiveScene(slot.sceneSlot)
     }
     slot.syncedAt = now()
     if (options.saveScene) {
@@ -504,7 +576,7 @@ async function syncBandSlot(event, slot, options = {}) {
       if (band) { band.setups ||= []; band.setups.push(setup); band.updatedAt = now() }
     }
   }
-  return { bandId: slot.bandId, bandName: slot.bandName, sceneName, sceneSlot: slot.sceneSlot, commandCount: compiled.commands.length, inputCount: compiled.inputs.length, mode: options.inputId ? 'input' : options.saveScene ? 'scene' : 'channels', sceneLoad, verifiedScene }
+  return { bandId: slot.bandId, bandName: slot.bandName, sceneName, sceneSlot: slot.sceneSlot, commandCount: compiled.commands.length, inputCount: compiled.inputs.length, mode: options.inputId ? 'input' : options.saveScene ? 'scene' : 'channels', sceneLoad, verifiedScene, recalledScene }
 }
 
 app.post('/api/events/:id/sync', async (request, response) => {
@@ -513,39 +585,67 @@ app.post('/api/events/:id/sync', async (request, response) => {
   if (!event.bands.length) return response.status(409).json({ error: 'Add at least one band first' })
   event.sceneStart = normalizeSceneStart(event.sceneStart)
   if (event.sceneStart + event.bands.length > 100) return response.status(409).json({ error: 'The event would exceed X32 scene slot 99' })
-  lastSnapshot = structuredClone(consoleState)
-  const scenes = []
-  let template = { enabled: false }
-  try {
-    template = await ensureTemplateScene()
-    if (template.enabled && event.bands.some((_, index) => event.sceneStart + index === template.slot)) throw new Error(`Scene ${template.slot} is reserved for the clean template scene`)
-    for (const slot of event.bands) scenes.push(await syncBandSlot(event, slot, { saveScene: true, template }))
-    event.status = 'synced'; event.lastSyncedAt = now(); event.updatedAt = now(); await persist(); broadcast('console-state', consoleState); response.json({ eventId: event.id, template, scenes })
-  } catch (error) { response.status(500).json({ error: error.message, template, scenes }) }
+  const job = createSyncJob({
+    type: 'event',
+    label: `Sync ${event.bands.length} scenes for ${event.name}`,
+    eventId: event.id,
+    work: async () => {
+      lastSnapshot = structuredClone(consoleState)
+      const scenes = []
+      const template = await ensureTemplateScene()
+      if (template.enabled && event.bands.some((_, index) => event.sceneStart + index === template.slot)) throw new Error(`Scene ${template.slot} is reserved for the clean template scene`)
+      for (const slot of event.bands) scenes.push(await syncBandSlot(event, slot, { saveScene: true, template }))
+      event.status = 'synced'; event.lastSyncedAt = now(); event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
+      return { eventId: event.id, template, scenes }
+    }
+  })
+  response.status(202).json({ job })
 })
 
 app.post('/api/events/:id/bands/:slotId/sync', async (request, response) => {
   const event = findEvent(request.params.id); const slot = event?.bands.find(candidate => candidate.id === request.params.slotId)
   if (!slot) return response.status(404).json({ error: 'Band slot not found' })
   event.sceneStart = normalizeSceneStart(event.sceneStart)
-  lastSnapshot = structuredClone(consoleState)
-  try {
-    const saveScene = request.body.mode !== 'channels'
-    const result = await syncBandSlot(event, slot, { saveScene, persistScene: !saveScene, useTemplate: saveScene && store.settings?.useTemplateScene })
-    if (saveScene) { event.status = 'synced'; event.lastSyncedAt = now() }
-    event.updatedAt = now(); await persist(); broadcast('console-state', consoleState); response.json({ eventId: event.id, result })
-  } catch (error) { response.status(500).json({ error: error.message }) }
+  const saveScene = request.body.mode !== 'channels'
+  const job = createSyncJob({
+    type: saveScene ? 'artist-scene' : 'artist-channels',
+    label: `${saveScene ? 'Sync scene' : 'Apply channels'} for ${slot.bandName}`,
+    eventId: event.id,
+    slotId: slot.id,
+    work: async () => {
+      lastSnapshot = structuredClone(consoleState)
+      const result = await syncBandSlot(event, slot, { saveScene, persistScene: !saveScene, useTemplate: saveScene && store.settings?.useTemplateScene })
+      if (saveScene) { event.status = 'synced'; event.lastSyncedAt = now() }
+      event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
+      return { eventId: event.id, result }
+    }
+  })
+  response.status(202).json({ job })
 })
 
 app.post('/api/events/:id/bands/:slotId/inputs/:inputId/sync', async (request, response) => {
   const event = findEvent(request.params.id); const slot = event?.bands.find(candidate => candidate.id === request.params.slotId)
   if (!slot) return response.status(404).json({ error: 'Band slot not found' })
   event.sceneStart = normalizeSceneStart(event.sceneStart)
-  lastSnapshot = structuredClone(consoleState)
-  try {
-    const result = await syncBandSlot(event, slot, { saveScene: false, persistScene: true, useTemplate: false, inputId: request.params.inputId })
-    event.updatedAt = now(); await persist(); broadcast('console-state', consoleState); response.json({ eventId: event.id, result })
-  } catch (error) { response.status(500).json({ error: error.message }) }
+  const job = createSyncJob({
+    type: 'input-channel',
+    label: `Apply one channel for ${slot.bandName}`,
+    eventId: event.id,
+    slotId: slot.id,
+    inputId: request.params.inputId,
+    work: async () => {
+      lastSnapshot = structuredClone(consoleState)
+      const result = await syncBandSlot(event, slot, { saveScene: false, persistScene: true, useTemplate: false, inputId: request.params.inputId })
+      event.updatedAt = now(); await persist(); broadcast('console-state', consoleState)
+      return { eventId: event.id, result }
+    }
+  })
+  response.status(202).json({ job })
+})
+
+app.get('/api/sync-jobs/:id', (request, response) => {
+  const job = syncJobs.get(request.params.id)
+  job ? response.json(publicSyncJob(job)) : response.status(404).json({ error: 'Sync job not found' })
 })
 
 app.get('/api/events/:id/gear', (request, response) => { const event = findEvent(request.params.id); event ? response.json(calculateEventGear(event, store.inventory)) : response.status(404).json({ error: 'Event not found' }) })
@@ -571,9 +671,9 @@ app.get('/api/intake/:token', (request, response) => { const found = findIntake(
 app.put('/api/intake/:token', async (request, response) => {
   const found = findIntake(request.params.token)
   if (!found) return response.status(404).json({ error: 'This intake link is invalid or expired' })
-  Object.assign(found.slot, { contactName: request.body.contactName || '', contactEmail: request.body.contactEmail || '', members: request.body.members || [], notes: request.body.notes || '', intakeStatus: 'submitted', submittedAt: now() })
+  Object.assign(found.slot, { contactName: request.body.contactName || '', contactEmail: request.body.contactEmail || '', members: request.body.members || [], monitors: request.body.monitors || [], notes: request.body.notes || '', intakeStatus: 'submitted', submittedAt: now() })
   const band = findBand(found.slot.bandId)
-  if (band) Object.assign(band, { contactName: found.slot.contactName, contactEmail: found.slot.contactEmail, members: structuredClone(found.slot.members), notes: found.slot.notes, updatedAt: now() })
+  if (band) Object.assign(band, { contactName: found.slot.contactName, contactEmail: found.slot.contactEmail, members: structuredClone(found.slot.members), monitors: structuredClone(found.slot.monitors ?? []), notes: found.slot.notes, updatedAt: now() })
   found.event.updatedAt = now(); await persist(); response.json(publicBandSlot(found.event, found.slot))
 })
 
